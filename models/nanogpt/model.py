@@ -15,17 +15,6 @@ import inspect
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.distributed.tensor.parallel._view_with_dim_change import (
-    _view_with_sharding_dim_change,
-)
-
-from torch.distributed._tensor import (
-    DeviceMesh,
-    distribute_tensor,
-    DTensor,
-    Replicate,
-    Shard,
-)
 
 from triton_flash22_bfloat16 import attention as flash22_bf16_attention
 from triton_flash22_fp16 import attention as flash22_fp16_attention
