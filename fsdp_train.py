@@ -1,7 +1,6 @@
 import inspect
 import math
 import os
-import pickle
 import time
 
 import numpy as np
@@ -11,10 +10,9 @@ from torch.distributed import destroy_process_group, init_process_group
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from models.nanogpt.model import CausalSelfAttention, MLP, GPT, GPTConfig
-
-import config.nanogpt_config as fsdp_config
-
-import time
+from torch.distributed.fsdp import MixedPrecision
+from distutils.version import LooseVersion
+import torch.cuda.nccl as nccl
 
 # io
 out_dir = "out"
@@ -37,13 +35,11 @@ gradient_accumulation_steps = 1
 block_size = 1024
 
 # model
-n_layer = 12
-n_head = 12
-n_embd = 768
+n_layer = 32
+n_head = 16
+n_embd = 1024
 dropout = 0.0  # for pretraining 0 is good, for finetuning try 0.1+
 bias = False  # do we use bias inside LayerNorm and Linear layers?
-use_flash22_bf16 = False
-use_flash22_fp16 = False
 use_flash_pytorch_sdpa = True
 
 # adamw optimizer
@@ -60,13 +56,9 @@ warmup_iters = 2000
 lr_decay_iters = 600000  # should be ~= max_iters per Chinchilla
 min_lr = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
-# DDP settings
-backend = "nccl"
-# system
-device = ("cuda")
+device = "cuda"
 
 compile = True
-pt2_compile = True
 iters_to_run = 50000
 num_epochs = 2
 
@@ -78,18 +70,11 @@ use_mixed_precision: bool = True
 wrapping_policy = ModuleWrapPolicy({CausalSelfAttention, MLP})
 model_sharding_strategy = ShardingStrategy.FULL_SHARD
 
-# optimizer overlap
-use_optimizer_overlap: bool = True
-
-# stats - dynamic, not set by user
-current_model_params: int = 0
-
 # Init TP
 _multi_gpu = int(os.environ.get("RANK", -1)) != -1  # verify distributed run
 assert _multi_gpu, "this config assumes distributed setup - multi-gpu not ready here."
 
-
-init_process_group(backend=backend)
+init_process_group(backend="nccl")
 _rank = int(os.environ["RANK"])
 _local_rank = int(os.environ["LOCAL_RANK"])
 
@@ -103,7 +88,6 @@ seed_offset = _rank
 def rank_print(x):
     if _rank == 0:
         print(x)
-
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -124,50 +108,20 @@ batch_size = batch_size
 def get_batch(split):
     data = train_data if split == "train" else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack(
-        [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
-    )
-    y = torch.stack(
-        [torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64)) for i in ix]
-    )
+    x = torch.stack([torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64)) for i in ix])
     if device_type == "cuda":
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(
-            device, non_blocking=True
-        )
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
     return x, y
-
-def get_vocab_size():
-    meta_path = os.path.join(data_dir, "meta.pkl")
-    meta_vocab_size = None
-    if os.path.exists(meta_path):
-        with open(meta_path, "rb") as f:
-            meta = pickle.load(f)
-        meta_vocab_size = meta["vocab_size"]
-        print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-
-    assert (
-        meta_vocab_size is not None
-    ), "Failed to determine vocab size"
-    return meta_vocab_size
-
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
 
 rank_print("Initializing a new model from scratch")
-
-rank_print("Before Model Initialization")
-
-if vocab_size is None:
-    vocab_size = get_vocab_size()
-
-n_layer: int = 32
-n_head: int = 16
-n_embd: int = 1024
 
 model_args = dict(
     n_layer=n_layer,
@@ -177,8 +131,6 @@ model_args = dict(
     bias=bias,
     vocab_size=vocab_size,
     dropout=dropout,
-    use_flash22_fp16=use_flash22_fp16,
-    use_flash22_bf16=use_flash22_bf16,
 )
 
 gpt_conf = GPTConfig(**model_args)
@@ -190,11 +142,29 @@ rank_print("Model Initialization done")
 # we need this or else calcing mfu in fsdp = sharded model size...
 fsdp_pg = None
 
-from config.mixed_precision import get_mixed_precision_policy
 
 mixed_precision_policy = None
 if use_mixed_precision:
-    mixed_precision_policy = get_mixed_precision_policy()
+    bf16_ready = (
+        torch.version.cuda
+        and LooseVersion(torch.version.cuda) >= "11.0"
+        and dist.is_nccl_available()
+        and nccl.version() >= (2, 10)
+    )
+
+    if bf16_ready:
+        bfSixteen = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            # Gradient communication precision.
+            reduce_dtype=torch.bfloat16,
+            # Buffer precision.
+            buffer_dtype=torch.bfloat16,
+        )
+        mixed_precision_policy = bfSixteen
+    else:
+        print(
+            f"mixed precision = bfloat16, but this gpu or nccl version does not support native BF16\n"
+        )
 
 model = FSDP(
     model,
@@ -206,11 +176,9 @@ model = FSDP(
     use_orig_params=True,
 )
 
-
 # ---- debug print gpu's in use by FSDP
 shard_g_size = model.process_group.size()
 shard_rank = model.process_group.rank()
-replicate_g = None  # model._inter_node_state.process_group
 
 dist.barrier()
 print(f"{shard_g_size=}, {shard_rank=}\n")
@@ -218,7 +186,6 @@ dist.barrier()
 
 # optimizer
 # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
-
 use_fused = (device_type == "cuda") and (
     "fused" in inspect.signature(torch.optim.AdamW).parameters
 )
