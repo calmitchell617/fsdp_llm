@@ -21,7 +21,7 @@ import torch.distributed as dist
 @dataclass
 class train_config(base_config):
     # current models = "10.5M", "124M", "201M", "1B", "1.5B"
-    model_name: str = "124M"
+    model_name: str = "1B"
     use_tensor_parallel: bool = False
 
     dataset = "openwebtext"  # options = shakespeare_char, openwebtext
@@ -46,10 +46,10 @@ class train_config(base_config):
     # training
     # use PT2 training compiler to speed up training (faster when it works but not all models compile..)
     pt2_compile: bool = True
-    iters_to_run: int = 8  # << --- Set to None to run epochs
+    iters_to_run: int = 50000  # << --- Set to None to run epochs
     num_epochs: int = 2
 
-    batch_size = 16
+    batch_size = 8
     block_size = 1024  # 256  # 1024 = gpt2, openwebtext, context of up to 256 previous characters
     use_bias: bool = False  # use bias in linear layers (recommend No)
     vocab_size: int = 50304  # use 65 for shakespeare, GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
@@ -105,9 +105,9 @@ def build_model(cfg, tp_mesh=None, rank=None):
         n_embd: int = 1024
 
     elif model_name == "1B":
-        n_layer: int = 48
-        n_head: int = 20
-        n_embd: int = 1280
+        n_layer: int = 32
+        n_head: int = 16
+        n_embd: int = 1024
 
     elif model_name == "1.5B":
         n_layer: int = 46
