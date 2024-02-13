@@ -63,7 +63,7 @@ class LayerNorm(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, mesh, config):
+    def __init__(self, config):
         super().__init__()
         assert (
             config.n_embd % config.n_head == 0
@@ -121,7 +121,6 @@ class CausalSelfAttention(nn.Module):
                 ),
             )
 
-        self.mesh = mesh
         self.n_embd = config.n_embd
 
         # key, query, value projections for all heads, but in a batch
@@ -132,14 +131,7 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
-        # TP (2D) specific checks
-        if self.mesh is not None:
-            self.tp_size = self.mesh.mesh.size(0)
-            assert (
-                self.n_head % self.tp_size == 0
-            ), "num of heads are not divisible by tp size."
-        else:
-            self.tp_size = 1
+        self.tp_size = 1
 
         # pre-calc num heads if using tp (if fsdp only, tp_size = 1 so inert)
         self.tp_num_heads = self.n_head // self.tp_size
@@ -240,10 +232,10 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, mesh, config):
+    def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(mesh, config)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -254,7 +246,7 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, mesh, config, rank=None):
+    def __init__(self, config, rank=None):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
@@ -265,7 +257,7 @@ class GPT(nn.Module):
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
                 wpe=nn.Embedding(config.block_size, config.n_embd),
                 drop=nn.Dropout(config.dropout),
-                h=nn.ModuleList([Block(mesh, config) for _ in range(config.n_layer)]),
+                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
                 ln_f=LayerNorm(config.n_embd, bias=config.bias),
             )
         )
